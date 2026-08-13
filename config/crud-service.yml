@@ -1,0 +1,22 @@
+spring:
+  application:
+    name: crud-service
+
+# AWS Secrets Manager Configuration
+aws:
+  region: us-east-1
+  secretsmanager:
+    # Optional endpoint override for local development (e.g. LocalStack)
+    endpoint: "" 
+
+# In-Memory Cache settings for AWS Secrets Manager calls
+cache:
+  secrets:
+    ttl-minutes: 15
+    max-size: 500
+
+logging:
+  level:
+    root: INFO
+    com.finance: DEBUG
+    software.amazon.awssdk.services.secretsmanager: INFO

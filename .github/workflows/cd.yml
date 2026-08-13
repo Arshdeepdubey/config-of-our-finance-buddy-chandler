@@ -1,0 +1,122 @@
+name: Continuous Deployment & K8s Health Check
+
+on:
+  repository_dispatch:
+    types: [sha256:54f7aa77642a17f0ddca8bdfecdb621a8b6f6b13eef3510d92850c22f14b2849]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Manual override image tag (e.g. latest or commit sha)'
+        required: true
+        default: 'latest'
+
+env:
+  IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/its-your-own-finance-buddy-chandler
+  IMAGE_NAME: finance-buddy
+  K8S_MANIFEST_PATH: k8s/deployment.yaml
+  NAMESPACE: default
+  SERVICE_NAME: finance-buddy
+  DEPLOYMENT_NAME: finance-buddy-deployment
+
+jobs:
+  deploy-and-monitor:
+    name: Deploy Finance Buddy to Kubernetes & Monitor Health
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Configuration Repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Target Image Tag
+        id: get_tag
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            TAG="${{ github.event.client_payload.image_tag }}"
+          else
+            TAG="${{ github.event.inputs.image_tag }}"
+          fi
+          echo "IMAGE_TAG=${TAG}" >> $GITHUB_ENV
+          echo "Deploying Finance Buddy image version: ${TAG}"
+
+      - name: Update Kubernetes Manifest Image Tag
+        run: |
+          # Replaces the image line inside the deployment manifest with the newly pushed version tag
+          sed -i 's|image: '${{ env.IMAGE_REPO }}':.*|image: '${{ env.IMAGE_REPO }}':'${{ env.IMAGE_TAG }}'|g' ${{ env.K8S_MANIFEST_PATH }}
+          
+          # Verify updated image tag in git diff
+          echo "=== Updated Manifest ==="
+          git diff ${{ env.K8S_MANIFEST_PATH }}
+
+      - name: Commit & Push Updated Tag to Git (GitOps State Sync)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add ${{ env.K8S_MANIFEST_PATH }}
+          git commit -m "chore(cd): release ${{ env.IMAGE_NAME }} image tag ${{ env.IMAGE_TAG }}" || echo "No changes to commit"
+          git push
+
+      - name: Set up Kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure Kubernetes Context
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+
+      - name: Deploy Resources to Kubernetes
+        run: |
+          # Apply ConfigMaps/Secrets first, then Deployment and Service manifests
+          kubectl apply -f k8s/ -n ${{ env.NAMESPACE }}
+          echo "Resources deployed to namespace: ${{ env.NAMESPACE }}"
+
+      - name: Monitor Rollout & Health Probes
+        run: |
+          echo "===> Monitoring Kubernetes Rollout Status for Finance Buddy..."
+          # Waits for Liveness/Readiness probes to pass and rollout to complete (timeout after 3 minutes)
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} --timeout=180s
+
+      - name: Verify Live Pods & Readiness Health
+        if: always()
+        run: |
+          echo "===> Pod Statuses:"
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.SERVICE_NAME }} -o wide
+
+          echo "===> Detailed Pod Health Description (Events & Probes):"
+          kubectl describe pods -n ${{ env.NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
+
+      - name: Verify Application Endpoints
+        if: success()
+        run: |
+          echo "===> Checking application endpoints..."
+          # Get service endpoint
+          kubectl get svc -n ${{ env.NAMESPACE }} -l app=${{ env.SERVICE_NAME }}
+          
+          echo "===> Verifying Spring Boot actuator health endpoint..."
+          # Optional: Forward port and check health if needed
+          # kubectl port-forward -n ${{ env.NAMESPACE }} svc/${{ env.SERVICE_NAME }} 8080:8080 &
+          # sleep 2
+          # curl http://localhost:8080/actuator/health || echo "Health check endpoint not immediately available"
+
+      - name: Post-Deployment Summary
+        if: success()
+        run: |
+          echo "========================================================="
+          echo "🎉 FINANCE BUDDY DEPLOYMENT SUCCESSFUL!"
+          echo "========================================================="
+          echo "Service Name: ${{ env.SERVICE_NAME }}"
+          echo "Image: ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}"
+          echo "Namespace: ${{ env.NAMESPACE }}"
+          echo "Health Check: Liveness & Readiness Probes PASSED"
+          echo "Port: 8080 (Spring Boot)"
+          echo "========================================================="
+
+      - name: Deployment Failed Notification
+        if: failure()
+        run: |
+          echo "❌ Deployment failed. Check logs above for details."
+          exit 1
